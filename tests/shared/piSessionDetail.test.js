@@ -7,7 +7,7 @@ const path = require('node:path');
 const test = require('node:test');
 
 const { parsePiTranscript, readSessionDetail } = require('../../src/shared/sessionDetail');
-const { pricePiSessionDetail } = require('../../src/shared/providers/codex/localUsage');
+const { pricePiSessionDetail, waitForPricingWarm } = require('../../src/shared/providers/codex/localUsage');
 const { exchangeRows } = require('../../src/electron/renderer/sessionDetail');
 
 function tmpHome() {
@@ -101,7 +101,7 @@ test('Pi filters operation usage by its own date and keeps reply numbering', () 
   } finally { cleanup(home); }
 });
 
-test('Pi operation-only usage before a prompt retains the unpriced cost fallback', () => {
+test('Pi operation-only usage before a prompt stays unpriced', () => {
   const home = tmpHome();
   try {
     writePiSession(home, 'unpriced-operations', [
@@ -111,9 +111,11 @@ test('Pi operation-only usage before a prompt retains the unpriced cost fallback
     const detail = readSessionDetail({ client: 'pi', sessionId: 'unpriced-operations', sessionCost: 6, home });
     assert.equal(detail.totals.totalTokens, 60);
     assert.equal(detail.totals.turnCount, 0);
-    assert.equal(detail.totals.costUsd, 6);
+    // No reported price and no model to look up here, so no price at all: the
+    // session subtotal is never split across these operations.
+    assert.equal(detail.totals.costUsd, 0);
     assert.equal(detail.exchanges[0].promptPreview, '');
-    assert.deepEqual(detail.exchanges[0].turns.map(turn => turn.costEstimate), [2, 4]);
+    assert.deepEqual(detail.exchanges[0].turns.map(turn => turn.costEstimate), [0, 0]);
   } finally { cleanup(home); }
 });
 
@@ -156,6 +158,45 @@ test('parsePiTranscript yields prompts and turns with exact tokens, tools and co
   assert.equal(events[1].model, 'deepseek-v4-pro');
   assert.equal(events[2].tokens.total, 360);
   assert.equal(events[2].tokens.cacheWrite, 10);
+});
+
+test('a Pi compaction after a reply is billed to that reply\'s model', async () => {
+  // Pi's `/compact` record names no model, and tokscale attributes it to the
+  // session's current model: the last reply's, which is what the tokens around
+  // it were billed against. Without that the turn could never be priced.
+  const home = tmpHome();
+  try {
+    writePiSession(home, 'compaction-model', [
+      user('compact please'),
+      JSON.stringify({
+        type: 'message', id: 'm1', parentId: 'm0', timestamp: '2026-10-12T02:28:43.000Z',
+        message: {
+          role: 'assistant', model: 'deepseek-v4-pro', content: [{ type: 'text', text: 'a' }],
+          usage: { input: 100, output: 100, cacheRead: 0, cacheWrite: 0, reasoning: 0, totalTokens: 200, cost: { total: 0 } }
+        }
+      }),
+      extraUsage('compaction', { input: 50, output: 10, cost: { total: 0 } }, '2026-10-12T02:28:44.000Z')
+    ]);
+
+    const detail = readSessionDetail({ client: 'pi', sessionId: 'compaction-model', sessionCost: 6, home });
+    const turns = detail.exchanges[0].turns;
+    assert.deepEqual(turns.map((turn) => turn.model), ['deepseek-v4-pro', 'deepseek-v4-pro']);
+
+    // The first read only schedules the lookup; the second prices from cache.
+    const options = {
+      pricingRevision: 'pi-compaction-model-test',
+      lookupModelPricing: async () => ({
+        pricing: { inputCostPerToken: 0.000001, outputCostPerToken: 0.000002, cacheReadInputTokenCost: 0, cacheCreationInputTokenCost: 0 }
+      })
+    };
+    await pricePiSessionDetail(detail, options);
+    await waitForPricingWarm();
+    await pricePiSessionDetail(detail, options);
+
+    assert.ok(Math.abs(turns[0].costEstimate - 0.0003) < 1e-12);
+    // 50 input + 10 output of the compaction record.
+    assert.ok(Math.abs(turns[1].costEstimate - 0.00007) < 1e-12);
+  } finally { cleanup(home); }
 });
 
 test('parsePiTranscript keeps an [image] marker for an image-only prompt', () => {
@@ -201,7 +242,7 @@ test('readSessionDetail reads a pi transcript and uses the reported per-turn cos
   } finally { cleanup(home); }
 });
 
-test('readSessionDetail splits the session cost when Pi reports no price', () => {
+test('readSessionDetail never splits the session cost across Pi turns', () => {
   const home = tmpHome();
   try {
     writePiSession(home, 'pi-session-2', [
@@ -212,10 +253,45 @@ test('readSessionDetail splits the session cost when Pi reports no price', () =>
 
     const detail = readSessionDetail({ client: 'pi', sessionId: 'pi-session-2', sessionCost: 6, home });
 
-    assert.equal(detail.totals.costUsd, 6);
-    // 200 / 600 and 400 / 600.
-    assert.equal(detail.exchanges[0].turns[0].costEstimate, 2);
-    assert.equal(detail.exchanges[0].turns[1].costEstimate, 4);
+    // A turn is either priced or unpriced; the session subtotal must not become
+    // a per-turn price. Splitting it also made the catalog lookup below a no-op.
+    assert.equal(detail.totals.costUsd, 0);
+    assert.equal(detail.exchanges[0].turns[0].costEstimate, 0);
+    assert.equal(detail.exchanges[0].turns[1].costEstimate, 0);
+  } finally { cleanup(home); }
+});
+
+test('pricePiSessionDetail prices unpriced turns even when the session has a scan cost', async () => {
+  const home = tmpHome();
+  try {
+    writePiSession(home, 'scan-priced', [
+      user('scan already priced this session'),
+      JSON.stringify({
+        type: 'message', id: 'm1', parentId: 'p1', timestamp: '2026-10-12T02:28:44.000Z',
+        message: {
+          role: 'assistant', model: 'deepseek-v4-pro', content: [{ type: 'text', text: 'a' }],
+          usage: { input: 100, output: 100, cacheRead: 0, cacheWrite: 0, reasoning: 0, totalTokens: 200, cost: { total: 0 } }
+        }
+      })
+    ]);
+
+    // A session the scan could price arrives with sessionCost > 0; that number
+    // belongs to the row, not to any single turn.
+    const detail = readSessionDetail({ client: 'pi', sessionId: 'scan-priced', sessionCost: 6, home });
+    const options = {
+      pricingRevision: 'pi-scan-priced-test',
+      lookupModelPricing: async () => ({
+        pricing: { inputCostPerToken: 0.000001, outputCostPerToken: 0.000002, cacheReadInputTokenCost: 0, cacheCreationInputTokenCost: 0 }
+      })
+    };
+    // Reading a detail never waits on the catalog: the rate arrives in the cache
+    // while the page is already painted, and the next read prices the turn.
+    await pricePiSessionDetail(detail, options);
+    await waitForPricingWarm();
+    await pricePiSessionDetail(detail, options);
+
+    assert.ok(Math.abs(detail.exchanges[0].turns[0].costEstimate - 0.0003) < 1e-12);
+    assert.ok(Math.abs(detail.totals.costUsd - 0.0003) < 1e-12);
   } finally { cleanup(home); }
 });
 
@@ -232,12 +308,15 @@ test('pricePiSessionDetail prices only the turns pi could not price', async () =
     const detail = readSessionDetail({ client: 'pi', sessionId: 'mixed-pricing', sessionCost: 0.5, home });
     assert.deepEqual(detail.exchanges[0].turns.map((turn) => turn.costEstimate), [0.01, 0]);
 
-    await pricePiSessionDetail(detail, {
+    const options = {
       pricingRevision: 'pi-mixed-price-test',
       lookupModelPricing: async (model) => model === 'deepseek-v4-pro' ? {
         pricing: { inputCostPerToken: 0.000001, outputCostPerToken: 0.000002, cacheReadInputTokenCost: 0, cacheCreationInputTokenCost: 0 }
       } : null
-    });
+    };
+    await pricePiSessionDetail(detail, options);
+    await waitForPricingWarm();
+    await pricePiSessionDetail(detail, options);
 
     // Reported price stays; only the zero-cost turn is priced from the catalog.
     assert.equal(detail.exchanges[0].turns[0].costEstimate, 0.01);

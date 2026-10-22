@@ -36,17 +36,22 @@ A user message is always a real prompt boundary: tool output arrives as its own 
 
 Session Detail also counts top-level `usage` entries (including `kind: "cache_warm"`), `compaction.usage`, `branch_summary.usage`, and `toolResult` message usage, matching [Pi's session statistics](https://github.com/earendil-works/pi/blob/v1.2.0/packages/coding-agent/src/core/agent-session.ts#L4204-L4238). These billed operations remain in the shared exchange breakdown and period filtering, with distinct usage labels; they do not consume reply numbers or increase the conversation turn count. Older summaries without usage contribute nothing: `tokensBefore` describes existing context, not newly billed tokens.
 
-`usage` follows OpenAI's convention: `input`/`output`/`cacheRead`/`cacheWrite` sum to `totalTokens`, and `reasoning` is an informational subset of `output`. Pi prices billed operations in `usage.cost.total`, so Session Detail uses their summed reported cost instead of splitting the session subtotal; a provider that reports no price falls back to that split.
+`usage` follows OpenAI's convention: `input`/`output`/`cacheRead`/`cacheWrite` sum to `totalTokens`, and `reasoning` is an informational subset of `output`. Pi prices billed operations in `usage.cost.total`, so Session Detail uses the summed reported cost. A turn Pi reported no price for is resolved by the main process against the rate catalog, or shown as unpriced tokens when the catalog has no rate: the session subtotal is never split across turns. Billed operations that name no model (`compaction`, `branch_summary`, `usage`, a `toolResult` without one) are attributed to the session's current model, the last reply's, matching tokscale's own rule. `detail.totals.costUsd` is therefore the sum of turn prices. The vendored scanner applies the same rule: it books those operations under a `tools/summaries` pseudo-model carrying the cost Pi reported, so the session row counts them too and matches `detail.totals.costUsd` for a compacted session. Measured on a 512-turn `deepseek-flash` session: the scan reports `deepseek-flash` 1.0565066 plus `tools/summaries` 0.0655023, and Detail totals 1.1220089 — the same money, split by the pseudo-model's name rather than by a price difference. The only residue is model-level: a model breakdown lists `tools/summaries` as its own model instead of folding it into the model that paid.
 
 ## Invariants and known gaps
 
 - **`reasoning` is never added to the total.** It is a subset of `output`; `totalTokens` is `input + output + cacheRead + cacheWrite`. Adding it would double-count.
 - **The session id is a filename suffix**, so the basename walk used for other clients cannot find a Pi transcript.
 - Session titles and timestamps for Pi are not read here yet; the scan supplies what the Sessions list shows.
-- **The bundled scanner still counts only assistant message usage.** Its separate Pi parser needs equivalent operation accounting, deduplication/pricing regression coverage and shared-parser cache invalidation before a separately approved bundle update. This Detail correction does not correct dashboard/history totals. The Detail live signature uses scanner-reported tokens/cost, so an operation-only append may not trigger a re-read while the page stays open; reopening reads the full transcript.
+- **The scan has no per-operation model**, so billed operations land in a model breakdown as their own `tools/summaries` pseudo-model. Its cost is Pi's own report, not an estimate, and session totals are unaffected: folding it into the current model is a display decision, not a correctness one.
+- **The scanner and Detail agree on tokens only for records both parsers understand.** An operation-only append does change the row's tokens and cost, so the open page re-reads it.
 
 ## Verification
 
 ```bash
 node --test tests/shared/piSessionDetail.test.js tests/shared/sessionFiles.test.js
+# The vendored binary must carry the same rule as the parser above; both gates
+# fail when the installed @tokscale/cli disagrees with scripts/vendor/tokscale.json.
+node --test tests/shared/verifyVendoredTokscaleRelease.test.js
+node_modules/@tokscale/cli-win32-x64-msvc/bin/tokscale.exe --version   # 4.20.0
 ```

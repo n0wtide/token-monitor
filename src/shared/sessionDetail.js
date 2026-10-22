@@ -435,6 +435,12 @@ function parsePiTranscriptLines(lines) {
           : obj.kind === 'cache_warm' ? 'cache-warm' : 'usage';
     }
     if (u) {
+      // Pi's billed operations (`compaction`, `branch_summary`, `usage`) and a
+      // `toolResult` without its own model name none, so they are billed to the
+      // session's current model — the last reply's — the way tokscale attributes
+      // them. Without that they could never be priced.
+      const model = message.model || currentModel || undefined;
+      if (message.model) currentModel = String(message.model);
       const tools = message.role === 'assistant' && Array.isArray(message.content)
         ? message.content.filter((part) => part && part.type === 'toolCall').map((part) => part.name)
         : [];
@@ -452,7 +458,7 @@ function parsePiTranscriptLines(lines) {
         // Pi and OMP report each operation's cost; prefer it over the
         // proportional split of the session subtotal.
         cost: num(u.cost && u.cost.total),
-        model: message.model || currentModel || undefined,
+        model,
         tools: uniqueTools(tools)
       });
     }
@@ -728,8 +734,11 @@ function readSessionDetail({ client, sessionId, period = 'total', sessionCost = 
   const now = new Date((deps.now || Date.now)());
   const grouped = filterExchangesByPeriod(groupEvents(events), period, now);
   // Pi and OMP price replies with `usage.cost.total`, so use the reported
-  // per-turn costs instead of splitting the session subtotal. A provider that
-  // reports no price (all zeros) falls back to that split.
+  // per-turn costs instead of splitting the session subtotal. A turn they did
+  // not price stays at zero here: the main process resolves it against the
+  // rate catalog, or leaves it unpriced. Splitting the session subtotal would
+  // invent a per-turn price that reads like a real one, and it hid the gap
+  // the catalog lookup exists to fill.
   const reportedCost = PI_FORMAT_CLIENTS.has(client)
     ? grouped.reduce((sum, ex) => sum + ex.turns.reduce((turnSum, t) => turnSum + num(t.costEstimate), 0), 0)
     : 0;
@@ -737,6 +746,8 @@ function readSessionDetail({ client, sessionId, period = 'total', sessionCost = 
   if (reportedCost > 0) {
     sumRealCost(grouped);
     costUsd = reportedCost;
+  } else if (PI_FORMAT_CLIENTS.has(client)) {
+    costUsd = 0;
   } else {
     distributeCost(grouped, sessionCost);
   }

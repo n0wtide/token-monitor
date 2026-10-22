@@ -118,7 +118,9 @@ function runSessionDetailWorker(args = {}, deps = {}) {
 
 async function readSessionDetailForPlatform(args = {}, deps = {}) {
   const detail = await runSessionDetailWorker(args, deps);
-  if (detail?.client === 'pi') {
+  // Pi and OMP write the same transcripts and both report a per-operation
+  // cost, so both get their unpriced turns resolved from the catalog.
+  if (detail?.client === 'pi' || detail?.client === 'omp') {
     return pricePiSessionDetail(detail, {
       lookupModelPricing: deps.lookupModelPricing,
       pricingRevision: deps.pricingRevision ?? deps.getPricingRevision?.()

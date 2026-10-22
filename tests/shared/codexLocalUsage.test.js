@@ -943,6 +943,7 @@ test('missing model or rates remain explicit across period/session/project norma
 test('ledger details price each observed request without allocating the known subtotal to unknown models', async (t) => {
   const { home, env, store } = fixture(t);
   const { readSessionDetailForPlatform } = require('../../src/shared/sessionDetailResolver');
+  const { waitForPricingWarm } = require('../../src/shared/providers/codex/localUsage');
   const { exchangeRows } = require('../../src/electron/renderer/sessionDetail');
   const { usageCostLabel } = require('../../src/electron/renderer/usageAttributionRows');
   const previousDay = new Date(Date.parse(AT) - 86400000).toISOString();
@@ -956,12 +957,18 @@ test('ledger details price each observed request without allocating the known su
   const lookups = [];
   // Real worker message boundary and main-process pricing injection, then both
   // renderer adapters. IDs, models and counters only; no transcript content.
-  const detail = await readSessionDetailForPlatform({ client: 'codex', sessionId: ID, env, period: 'total', sessionCost: 999 }, {
+  const options = {
     lookupModelPricing: async (model) => {
       lookups.push(model);
       return { pricing: { inputCostPerToken: 0.000001, cacheReadInputTokenCost: 0.0000001, outputCostPerToken: 0.000002 } };
     }
-  });
+  };
+  const args = { client: 'codex', sessionId: ID, env, period: 'total', sessionCost: 999 };
+  // A detail read only spends cached rates; the lookup it schedules lands after
+  // the page is painted, so the next read carries the price.
+  await readSessionDetailForPlatform(args, options);
+  await waitForPricingWarm();
+  const detail = await readSessionDetailForPlatform(args, options);
   const expected = 44911 * 0.000001 + 105216 * 0.0000001 + 52 * 0.000002;
   assert.deepEqual(lookups, ['detail-priced']);
   assert.equal(detail.totals.costUsd, expected);
@@ -979,13 +986,16 @@ test('ledger details price each observed request without allocating the known su
 
 
 test('detail estimates keep known bucket prices when another used bucket has no rate', async () => {
-  const { priceLocalSessionDetail } = require('../../src/shared/providers/codex/localUsage');
+  const { priceLocalSessionDetail, waitForPricingWarm } = require('../../src/shared/providers/codex/localUsage');
   const detail = { usageSource: 'codex-dots-local', totals: {}, exchanges: [{ turns: [{
     model: 'partial-price', tokens: { input: 100, cacheRead: 50, output: 10, total: 160 }
   }] }] };
-  const priced = await priceLocalSessionDetail(detail, { lookupModelPricing: async () => ({ pricing: {
+  const options = { pricingRevision: 'partial-rate-v1', lookupModelPricing: async () => ({ pricing: {
     inputCostPerToken: 0.01, cacheReadInputTokenCost: 0.01
-  } }) });
+  } }) };
+  await priceLocalSessionDetail(detail, options);
+  await waitForPricingWarm();
+  const priced = await priceLocalSessionDetail(detail, options);
   assert.equal(priced.totals.costUsd, 1.5);
   assert.equal(priced.totals.unpricedTokens, 10);
   assert.equal(priced.exchanges[0].turns[0].costEstimate, 1.5);
@@ -993,21 +1003,28 @@ test('detail estimates keep known bucket prices when another used bucket has no 
 });
 
 test('opening or refreshing Dots details bounds pricing work and never looks up unknown models', async () => {
-  const { priceLocalSessionDetail } = require('../../src/shared/providers/codex/localUsage');
+  const { priceLocalSessionDetail, waitForPricingWarm } = require('../../src/shared/providers/codex/localUsage');
   const lookups = [];
   const makeDetail = () => ({ usageSource: 'codex-dots-local', totals: {}, exchanges: [{ turns:
     [...Array.from({ length: 20 }, (_, index) => `bounded-model-${index}`), 'unknown'].map((model) => ({ model, tokens: { input: 1, total: 1 } }))
   }] });
-  const options = { lookupModelPricing: async (...args) => {
+  const options = { pricingRevision: 'bounded-detail-v1', lookupModelPricing: async (...args) => {
     lookups.push(args);
     return { pricing: { inputCostPerToken: 1 } };
   } };
-  for (let refresh = 0; refresh < 2; refresh += 1) {
+  for (let refresh = 0; refresh < 5; refresh += 1) {
+    const before = lookups.length;
     const detail = await priceLocalSessionDetail(makeDetail(), options);
-    assert.equal(detail.totals.costUsd, 16);
-    assert.equal(detail.totals.unpricedTokens, 5);
+    assert.ok(lookups.length - before <= 4, 'one read schedules at most a tick of lookups');
+    // Four models per read become priced; the four never looked up and the
+    // unknown model stay unpriced.
+    assert.equal(detail.totals.unpricedTokens, Math.max(5, 21 - 4 * refresh));
+    await waitForPricingWarm();
   }
-  assert.equal(lookups.length, 32);
+  assert.equal(lookups.length, 16, 'sixteen priced models, sixteen lookups, none repeated');
+  const warmed = await priceLocalSessionDetail(makeDetail(), options);
+  assert.equal(warmed.totals.costUsd, 16);
+  assert.equal(warmed.totals.unpricedTokens, 5);
   assert.ok(lookups.every(([model, timeout]) => model.startsWith('bounded-model-') && timeout === 1500));
 });
 
@@ -1198,4 +1215,37 @@ test('bounded Dots lookups preserve successful/missing cache lifetimes and expli
   await resolveLocalUsagePricing(rows, options);
   assert.equal(lookups.filter(({ model }) => model === 'aggregate-free').length, 2);
   assert.ok(lookups.every(({ model, timeout }) => model !== 'unknown' && timeout === 250));
+});
+
+test('a priced detail never falls back to unpriced while the revision holds', async (t) => {
+  const { priceLocalSessionDetail, waitForPricingWarm } = require('../../src/shared/providers/codex/localUsage');
+  let now = 6000000;
+  t.mock.method(Date, 'now', () => now);
+  let rate = 0.5;
+  const lookups = [];
+  const options = {
+    pricingRevision: 'detail-rate-lifetime',
+    lookupModelPricing: async (model) => { lookups.push(model); return { pricing: { inputCostPerToken: rate } }; }
+  };
+  const detail = () => ({ usageSource: 'codex-dots-local', totals: {}, exchanges: [{ turns: [
+    { model: 'detail-lifetime', tokens: { input: 10, output: 0, cacheRead: 0, cacheWrite: 0, total: 10 } }
+  ] }] });
+
+  await priceLocalSessionDetail(detail(), options);
+  await waitForPricingWarm();
+  const warm = await priceLocalSessionDetail(detail(), options);
+  assert.equal(warm.totals.costUsd, 5);
+  assert.equal(lookups.length, 1);
+
+  // Past the five-minute cache lifetime the page keeps the known rate and only
+  // schedules a background refresh; it must not blank out to unpriced.
+  now += 300001;
+  rate = 0.7;
+  const expired = await priceLocalSessionDetail(detail(), options);
+  assert.equal(expired.totals.costUsd, 5, 'the known rate is still shown');
+  assert.equal(expired.totals.unpricedTokens, undefined);
+  await waitForPricingWarm();
+  assert.equal(lookups.length, 2, 'the expired rate is refreshed in the background');
+  const refreshed = await priceLocalSessionDetail(detail(), options);
+  assert.equal(refreshed.totals.costUsd, 7);
 });

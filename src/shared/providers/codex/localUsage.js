@@ -119,6 +119,42 @@ async function refreshModelPricing(model, options = {}) {
   return pricing;
 }
 
+function cachedModelPricing(model, options = {}) {
+  // A known rate never turns the page back into "unpriced": the revision in the
+  // key is what invalidates it. An expired entry is still shown and refreshed
+  // in the background, while an expired miss stays a miss until a lookup lands.
+  return pricingCache.get(modelPricingCacheKey(model, options))?.pricing ?? undefined;
+}
+
+function modelPricingExpired(model, options = {}) {
+  const cached = pricingCache.get(modelPricingCacheKey(model, options));
+  return !cached || cached.until <= Date.now();
+}
+
+// A detail read must not wait on the catalog subprocess: it prices with what the
+// cache already holds and schedules the rest here, so the numbers land on the
+// next read instead of stalling the page. One lookup per model at a time, and
+// no more than a tick's worth per read.
+const warmingModels = new Set();
+let pricingWarmChain = Promise.resolve();
+
+function scheduleModelPricingWarm(models, options = {}) {
+  for (const model of models.slice(0, MAX_PRICING_LOOKUPS_PER_TICK)) {
+    const key = modelPricingCacheKey(model, options);
+    if (warmingModels.has(key)) continue;
+    warmingModels.add(key);
+    pricingWarmChain = pricingWarmChain
+      .then(() => refreshModelPricing(model, options))
+      .catch(() => {})
+      .finally(() => warmingModels.delete(key));
+  }
+  return pricingWarmChain;
+}
+
+function waitForPricingWarm() {
+  return pricingWarmChain;
+}
+
 async function resolveLocalUsagePricing(rows, options = {}) {
   const result = {};
   const models = [...new Set(rows.map((row) => row.model.toLowerCase()))];
@@ -161,9 +197,13 @@ async function priceSessionTurns(detail, options = {}) {
   const prices = new Map();
   // Bound the work when opening unusually large multi-model sessions. Omitted
   // models remain unpriced rather than blocking or borrowing another rate.
+  const unpriced = [];
   for (const model of models.slice(0, 16)) {
-    prices.set(model, await refreshModelPricing(model, options));
+    const cached = cachedModelPricing(model, options);
+    if (cached === undefined || modelPricingExpired(model, options)) unpriced.push(model);
+    prices.set(model, cached ?? null);
   }
+  scheduleModelPricingWarm(unpriced, options);
   let knownCost = 0;
   let unpricedTokens = 0;
   for (const ex of detail.exchanges || []) {
@@ -197,12 +237,19 @@ async function priceLocalSessionDetail(detail, options = {}) {
   return priceSessionTurns(detail, options);
 }
 
-// Pi reports a price per operation, except for a model its catalog cannot
-// price. Keep every reported number and resolve only those zero-cost turns
-// against the catalog the collector already uses.
+// Pi and OMP report a price per operation, except for a model their catalog
+// cannot price. Keep every reported number and resolve only those zero-cost
+// turns against the catalog the collector already uses.
 async function pricePiSessionDetail(detail, options = {}) {
-  if (detail?.client !== 'pi') return detail;
+  if (detail?.client !== 'pi' && detail?.client !== 'omp') return detail;
   return priceSessionTurns(detail, { ...options, onlyMissing: true });
 }
 
-module.exports = { buildLocalUsageView, readLocalUsageView, resolveLocalUsagePricing, priceLocalSessionDetail, pricePiSessionDetail };
+module.exports = {
+  buildLocalUsageView,
+  readLocalUsageView,
+  resolveLocalUsagePricing,
+  priceLocalSessionDetail,
+  pricePiSessionDetail,
+  waitForPricingWarm
+};

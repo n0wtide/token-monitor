@@ -416,8 +416,8 @@ test('the public session detail resolver uses the worker boundary', async () => 
   assert.equal(workerArgs, args);
 });
 
-test('Dots details retain shared same-revision prices on command failure and invalidate them on revision changes', async () => {
-  const { resolveLocalUsagePricing } = require('../../src/shared/providers/codex/localUsage');
+test('Dots details price from the shared cache and treat a revision change as unpriced until a lookup lands', async () => {
+  const { resolveLocalUsagePricing, waitForPricingWarm } = require('../../src/shared/providers/codex/localUsage');
   const models = ['resolver-dots-priced', 'resolver-dots-free'];
   const rates = [{ inputCostPerToken: 0.01 }, { inputCostPerToken: 0 }];
   const makeDetail = () => ({
@@ -448,6 +448,7 @@ test('Dots details retain shared same-revision prices on command failure and inv
     assert.ok(workerArgs.length > 0, 'pricing revision is read after the worker result');
     return revision;
   } };
+  // The aggregate tick owns the lookups; a detail read only spends what they left.
   behavior = 'throw';
   const aggregateFallback = await readSessionDetailForPlatform(args, deps);
   assert.equal(aggregateFallback.totals.costUsd, 1);
@@ -456,32 +457,88 @@ test('Dots details retain shared same-revision prices on command failure and inv
   assert.equal(aggregateFallback.exchanges[0].turns[1].costEstimate, 0);
   assert.equal(aggregateFallback.exchanges[0].turns[1].unpricedTokens, undefined, 'explicit zero pricing survives failures');
 
-  behavior = 'success';
+  const lookupsBeforeDetail = lookups.length;
   await readSessionDetailForPlatform(args, deps);
-  behavior = 'throw';
-  const detailFallback = await readSessionDetailForPlatform(args, deps);
-  assert.equal(detailFallback.totals.costUsd, 1);
-  assert.equal(detailFallback.totals.unpricedTokens, 100);
+  assert.equal(lookups.length, lookupsBeforeDetail, 'a priced detail read never spawns the catalog');
+
   const changedRevision = await readSessionDetailForPlatform(args, { ...deps, pricingRevision: 'resolver-dots-shared-v2' });
   assert.equal(changedRevision.totals.costUsd, 0);
   assert.equal(changedRevision.totals.unpricedTokens, 300, 'old-revision cache is never reused');
 
   behavior = 'missing';
-  const confirmedMissing = await readSessionDetailForPlatform(args, deps);
+  await readSessionDetailForPlatform(args, { ...deps, pricingRevision: 'resolver-dots-shared-v2' });
+  await waitForPricingWarm();
+  const confirmedMissing = await readSessionDetailForPlatform(args, { ...deps, pricingRevision: 'resolver-dots-shared-v2' });
   assert.equal(confirmedMissing.totals.costUsd, 0);
   assert.equal(confirmedMissing.totals.unpricedTokens, 300);
   behavior = 'throw';
-  const failureAfterMiss = await readSessionDetailForPlatform(args, deps);
+  const failureAfterMiss = await readSessionDetailForPlatform(args, { ...deps, pricingRevision: 'resolver-dots-shared-v2' });
   assert.equal(failureAfterMiss.totals.costUsd, 0, 'a confirmed miss does not resurrect an earlier success');
   assert.equal(failureAfterMiss.totals.unpricedTokens, 300);
+
+  // A confirmed miss is retried on its own 30s clock; a new revision asks the
+  // catalog again, and the rate it finds prices the next read.
   behavior = 'success';
-  await readSessionDetailForPlatform(args, deps);
+  const v3 = { ...deps, pricingRevision: 'resolver-dots-shared-v3' };
+  await readSessionDetailForPlatform(args, v3);
+  await waitForPricingWarm();
+  const repriced = await readSessionDetailForPlatform(args, v3);
+  assert.equal(repriced.totals.costUsd, 1);
+  assert.equal(repriced.totals.unpricedTokens, 100);
+
   const cached = await resolveLocalUsagePricing(models.map((model) => ({ model })), {
     pricingRevision: revision, lookupModelPricing: () => { throw new Error('warm aggregate must not look up prices'); }
   });
-  assert.deepEqual(models.map((model) => cached[model]), rates, 'detail successes update the aggregate cache too');
+  assert.deepEqual(models.map((model) => cached[model]), rates, 'a found rate survives for its revision');
   assert.ok(lookups.every(({ model, timeout }) => models.includes(model) && timeout === 1500));
   assert.ok(workerArgs.every((value) => value === args), 'pricing stays in main, outside worker data');
+});
+
+test('a Pi detail read is never blocked on a catalog lookup', async () => {
+  const { waitForPricingWarm } = require('../../src/shared/providers/codex/localUsage');
+  const makeDetail = () => ({
+    found: true, client: 'pi', totals: {},
+    exchanges: [{ costEstimate: 0, turns: [
+      { model: 'pi-inline-model', costEstimate: 0, tokens: { input: 100, output: 50, cacheRead: 0, cacheWrite: 0, reasoning: 0, total: 150 } }
+    ] }]
+  });
+  class PiWorker {
+    constructor() {
+      this.listeners = new Map();
+      queueMicrotask(() => this.listeners.get('message')?.({ ok: true, detail: makeDetail() }));
+    }
+    once(event, listener) { this.listeners.set(event, listener); return this; }
+  }
+  let finishLookup;
+  let lookups = 0;
+  const lookupModelPricing = () => {
+    lookups += 1;
+    return new Promise((resolve) => { finishLookup = resolve; });
+  };
+  const rates = { inputCostPerToken: 0.000001, outputCostPerToken: 0.000002, cacheReadInputTokenCost: 0, cacheCreationInputTokenCost: 0 };
+  const deps = { Worker: PiWorker, lookupModelPricing, getPricingRevision: () => 'pi-nonblocking-v1' };
+  const args = { client: 'pi', sessionId: 'nonblocking', period: 'total' };
+
+  // The lookup promise never settles, so a read that awaited it could not return.
+  const startedAt = Date.now();
+  const first = await readSessionDetailForPlatform(args, deps);
+  assert.ok(Date.now() - startedAt < 1000, 'the read does not wait for the catalog');
+  assert.equal(first.exchanges[0].turns[0].costEstimate, 0);
+  assert.equal(first.exchanges[0].turns[0].unpricedTokens, 150, 'an unknown rate is unpriced, never a share');
+  assert.equal(lookups, 1);
+
+  finishLookup({ pricing: rates });
+  await waitForPricingWarm();
+
+  const second = await readSessionDetailForPlatform(args, deps);
+  assert.ok(Math.abs(second.exchanges[0].turns[0].costEstimate - 0.0002) < 1e-12);
+  assert.equal(lookups, 1, 'a priced read reuses the cache instead of spawning again');
+
+  const changed = await readSessionDetailForPlatform(args, { ...deps, getPricingRevision: () => 'pi-nonblocking-v2' });
+  assert.equal(changed.exchanges[0].turns[0].costEstimate, 0, 'another revision never reuses the old rate');
+  assert.equal(lookups, 2);
+  finishLookup(null);
+  await waitForPricingWarm();
 });
 
 // dsh reads its own transcript format directly, so it always dispatches to
@@ -560,4 +617,150 @@ test('does not let a host DSH_HOME override leak into the WSL fallback attempt',
   assert.equal(detail.found, true);
   assert.deepEqual(envSeen[0], { DSH_HOME: 'C:\\custom\\dsh' }, 'the native attempt should still honor the host DSH_HOME');
   assert.deepEqual(envSeen[1], {}, 'the WSL attempt must not inherit the host DSH_HOME');
+});
+
+// The split used to happen in the detail worker, so a main-process pricer that
+// only filled zero-cost turns found nothing to fill. These two run the real
+// worker and the real resolver seam to keep that ordering covered.
+function piHome() {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'tm-resolver-pi-'));
+  const dir = path.join(home, '.pi', 'agent', 'sessions', '--D--project--');
+  fs.mkdirSync(dir, { recursive: true });
+  return { home, dir };
+}
+
+// The worker resolves its own home (`os.homedir()`), because the detail reader
+// deliberately ignores PI_CODING_AGENT_DIR to stay aligned with the scanner.
+async function asHome(home, run) {
+  const saved = { USERPROFILE: process.env.USERPROFILE, HOME: process.env.HOME };
+  process.env.USERPROFILE = home;
+  process.env.HOME = home;
+  try {
+    return await run();
+  } finally {
+    for (const [key, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+}
+
+function piAssistant({ model, cost, input = 0, output = 0, cacheRead = 0, timestamp }) {
+  return JSON.stringify({
+    type: 'message', id: `m-${timestamp}`, parentId: null, timestamp,
+    message: {
+      role: 'assistant', model, content: [{ type: 'text', text: 'x' }],
+      usage: { input, output, cacheRead, cacheWrite: 0, reasoning: 0, cost: { total: cost } }
+    }
+  });
+}
+
+test('a scan-priced Pi session still gets per-turn catalog prices, not a share', async () => {
+  const { waitForPricingWarm } = require('../../src/shared/providers/codex/localUsage');
+  const { home, dir } = piHome();
+  const sessionId = 'resolver-pi-priced';
+  fs.writeFileSync(path.join(dir, `2026-10-22T00-00-00-000Z_${sessionId}.jsonl`), [
+    JSON.stringify({ type: 'message', id: 'p', timestamp: '2026-10-22T00:00:01.000Z', message: { role: 'user', content: [{ type: 'text', text: 'go' }] } }),
+    // Pi priced this one itself; the catalog must not touch it.
+    piAssistant({ model: 'resolver-pi-model', cost: 0.01, input: 100, output: 100, timestamp: '2026-10-22T00:00:02.000Z' }),
+    piAssistant({ model: 'resolver-pi-model', cost: 0, input: 200, output: 100, timestamp: '2026-10-22T00:00:03.000Z' })
+  ].join('\n'));
+  const rates = { inputCostPerToken: 0.000001, outputCostPerToken: 0.000002, cacheReadInputTokenCost: 0, cacheCreationInputTokenCost: 0 };
+  const deps = {
+    lookupModelPricing: async () => ({ pricing: rates }),
+    getPricingRevision: () => 'resolver-pi-priced-v1'
+  };
+  // sessionCost is what the Sessions row reports for the whole session.
+  const args = { client: 'pi', sessionId, period: 'total', sessionCost: 6 };
+
+  try {
+    const detail = await asHome(home, async () => {
+      await readSessionDetailForPlatform(args, deps);
+      await waitForPricingWarm();
+      return readSessionDetailForPlatform(args, deps);
+    });
+
+    const turns = detail.exchanges[0].turns;
+    const sessionTokens = turns.reduce((sum, turn) => sum + turn.tokens.total, 0);
+    assert.equal(turns[0].costEstimate, 0.01, 'a reported price is kept as-is');
+    // 200 input + 100 output at the catalog rates, not 6 * 300 / 400.
+    assert.ok(Math.abs(turns[1].costEstimate - 0.0004) < 1e-12);
+    assert.ok(Math.abs(turns[1].costEstimate - 6 * (turns[1].tokens.total / sessionTokens)) > 1e-3, 'never a share of the session subtotal');
+    assert.ok(Math.abs(detail.totals.costUsd - 0.0104) < 1e-12);
+    assert.equal(detail.totals.unpricedTokens, undefined);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('a Pi session whose model the catalog cannot price is unpriced, not split', async () => {
+  const { waitForPricingWarm } = require('../../src/shared/providers/codex/localUsage');
+  const { home, dir } = piHome();
+  const sessionId = 'resolver-pi-unpriced';
+  fs.writeFileSync(path.join(dir, `2026-10-22T00-00-00-000Z_${sessionId}.jsonl`), [
+    JSON.stringify({ type: 'message', id: 'p', timestamp: '2026-10-22T00:00:01.000Z', message: { role: 'user', content: [{ type: 'text', text: 'go' }] } }),
+    piAssistant({ model: 'resolver-pi-unknown', cost: 0, input: 200, output: 100, timestamp: '2026-10-22T00:00:02.000Z' }),
+    piAssistant({ model: 'resolver-pi-unknown', cost: 0, input: 100, output: 50, timestamp: '2026-10-22T00:00:03.000Z' })
+  ].join('\n'));
+  const deps = {
+    lookupModelPricing: async () => null,
+    getPricingRevision: () => 'resolver-pi-unpriced-v1'
+  };
+  const args = { client: 'pi', sessionId, period: 'total', sessionCost: 6 };
+
+  try {
+    const detail = await asHome(home, async () => {
+      await readSessionDetailForPlatform(args, deps);
+      await waitForPricingWarm();
+      return readSessionDetailForPlatform(args, deps);
+    });
+
+    for (const turn of detail.exchanges[0].turns) {
+      assert.equal(turn.costEstimate, 0);
+      assert.equal(turn.unpricedTokens, turn.tokens.total);
+    }
+    assert.equal(detail.totals.costUsd, 0);
+    assert.equal(detail.totals.unpricedTokens, 450);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+// OMP writes the Pi transcript format and reports costs the same way, so its
+// unpriced turns go through the same catalog pricer.
+test('an OMP detail gets its zero-cost turns priced from the catalog', async () => {
+  const { waitForPricingWarm } = require('../../src/shared/providers/codex/localUsage');
+  const makeDetail = () => ({
+    found: true, client: 'omp', totals: {},
+    exchanges: [{
+      costEstimate: 0.02,
+      turns: [
+        { model: 'omp-reported', costEstimate: 0.02, tokens: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, reasoning: 0, total: 15 } },
+        { model: 'omp-unpriced', costEstimate: 0, tokens: { input: 100, output: 50, cacheRead: 0, cacheWrite: 0, reasoning: 0, total: 150 } }
+      ]
+    }]
+  });
+  class OmpWorker {
+    constructor() {
+      this.listeners = new Map();
+      queueMicrotask(() => this.listeners.get('message')?.({ ok: true, detail: makeDetail() }));
+    }
+    once(event, listener) { this.listeners.set(event, listener); return this; }
+  }
+  const deps = {
+    Worker: OmpWorker,
+    lookupModelPricing: async (model) => model === 'omp-unpriced'
+      ? { pricing: { inputCostPerToken: 0.000001, outputCostPerToken: 0.000002, cacheReadInputTokenCost: 0, cacheCreationInputTokenCost: 0 } }
+      : null,
+    getPricingRevision: () => 'resolver-omp-v1'
+  };
+  const args = { client: 'omp', sessionId: 'omp-seam', period: 'total' };
+
+  await readSessionDetailForPlatform(args, deps);
+  await waitForPricingWarm();
+  const detail = await readSessionDetailForPlatform(args, deps);
+
+  assert.equal(detail.exchanges[0].turns[0].costEstimate, 0.02, 'a reported price is kept');
+  assert.ok(Math.abs(detail.exchanges[0].turns[1].costEstimate - 0.0002) < 1e-12);
+  assert.ok(Math.abs(detail.totals.costUsd - 0.0202) < 1e-12);
 });
