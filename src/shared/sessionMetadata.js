@@ -13,6 +13,7 @@ const cursorSessionMetadata = require('./providers/cursor/sessionMetadata');
 const droidSessionMetadata = require('./providers/droid/sessionMetadata');
 const opencodeSession = require('./providers/opencode/session');
 const kimiSessionMetadata = require('./providers/kimi/sessionMetadata');
+const piSessionMetadata = require('./providers/pi/sessionMetadata');
 const dshSessionMetadata = require('./providers/dsh/sessionMetadata');
 const workbuddySession = require('./providers/workbuddy/sessionMetadata');
 const devinSessionMetadata = require('./providers/devin/sessionMetadata');
@@ -251,6 +252,9 @@ const SESSION_METADATA_RESOLVERS = new Map([
   ['opencode', { resolve: opencodeSession.resolveSessionMetadata, retryAfterTimestampFallback: true }],
   ['droid', { resolve: droidSessionMetadata.resolveSessionMetadata, retryAfterTimestampFallback: true }],
   ['kimi', { resolve: kimiSessionMetadata.resolveSessionMetadata, retryAfterTimestampFallback: false }],
+  // Pi keeps its rename and its prompts in the transcript, so the row label
+  // arrives with the same read as its timestamps.
+  ['pi', { resolve: piSessionMetadata.resolveSessionMetadata, retryAfterTimestampFallback: true }],
   ['dsh', { resolve: dshSessionMetadata.resolveSessionMetadata, retryAfterTimestampFallback: true }],
   ['devin', { resolve: devinSessionMetadata.resolveSessionMetadata, retryAfterTimestampFallback: true }],
   // Grok session ids are bare uuids, so the id-timestamp fallback above gives

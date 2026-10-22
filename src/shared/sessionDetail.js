@@ -751,6 +751,7 @@ module.exports = {
   parseCodebuddyTranscript,
   parseCodexTranscript,
   parsePiTranscript,
+  piPromptText,
   makeTokens,
   readCodebuddyExtensionSessionDetail,
   groupEvents,
