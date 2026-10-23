@@ -204,6 +204,9 @@ async function priceSessionTurns(detail, options = {}) {
     prices.set(model, cached ?? null);
   }
   scheduleModelPricingWarm(unpriced, options);
+  // Told to the renderer so a page opened right after launch can re-read once
+  // the catalog has answered; the numbers land on the next read, not this one.
+  if (unpriced.length > 0) detail.pricingPending = true;
   let knownCost = 0;
   let unpricedTokens = 0;
   for (const ex of detail.exchanges || []) {

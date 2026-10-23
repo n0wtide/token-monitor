@@ -5092,6 +5092,19 @@ function sessionLiveCost(entry, client) {
   return client === 'reasonix' ? Number(entry?.reportedCostUsd || 0) : Number(entry?.costUsd || 0);
 }
 
+// How many times an unpriced detail is re-read while the catalog lookups that
+// a read scheduled are still in flight.
+const MAX_PRICING_RETRIES = 3;
+const PRICING_RETRY_MS = 700;
+
+function schedulePricingRetry(request) {
+  if (request.pricingRetryTimer) return;
+  request.pricingRetryTimer = setTimeout(() => {
+    request.pricingRetryTimer = null;
+    if (state.openSession === request) void refreshOpenSessionDetail();
+  }, PRICING_RETRY_MS);
+}
+
 function sessionDetailLiveSignature() {
   const entry = sessionLiveStatsEntry(state.openSession);
   if (!entry) return '';
@@ -5120,7 +5133,12 @@ async function refreshOpenSessionDetail() {
     renderSessionDetail({ detail: request.detail, preserveScroll: true });
   }
   const signature = sessionDetailLiveSignature();
-  if (!signature || signature === request.liveSignature) return;
+  // A detail whose models were still being looked up is re-read until the
+  // catalog answers: after a restart the first page is unpriced and an idle
+  // session never pushes new stats, so nothing else would trigger the retry.
+  const pricingPending = request.detail.pricingPending === true
+    && (request.pricingRetries || 0) < MAX_PRICING_RETRIES;
+  if ((!signature || signature === request.liveSignature) && !pricingPending) return;
   const sessionCost = sessionLiveCost(sessionLiveStatsEntry(request), request.client);
   request.detailLiveBusy = true;
   let readSucceeded = false;
@@ -5135,6 +5153,7 @@ async function refreshOpenSessionDetail() {
     request.sessionCost = sessionCost;
     request.detail = detail;
     request.liveSignature = signature;
+    request.pricingRetries = detail.pricingPending === true ? (request.pricingRetries || 0) + 1 : 0;
     readSucceeded = true;
     // The reader can start a hover while the read is in flight, so the hold is
     // rechecked here rather than trusted from the call site.
@@ -5148,6 +5167,9 @@ async function refreshOpenSessionDetail() {
     // the same visibility/hold/signature guards; failures wait for a later retry.
     if (readSucceeded && state.openSession === request
       && sessionDetailLiveSignature() !== request.liveSignature) void refreshOpenSessionDetail();
+    else if (readSucceeded && state.openSession === request
+      && request.detail?.pricingPending === true
+      && (request.pricingRetries || 0) < MAX_PRICING_RETRIES) schedulePricingRetry(request);
   }
 }
 

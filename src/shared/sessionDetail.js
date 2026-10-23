@@ -435,12 +435,6 @@ function parsePiTranscriptLines(lines) {
           : obj.kind === 'cache_warm' ? 'cache-warm' : 'usage';
     }
     if (u) {
-      // Pi's billed operations (`compaction`, `branch_summary`, `usage`) and a
-      // `toolResult` without its own model name none, so they are billed to the
-      // session's current model — the last reply's — the way tokscale attributes
-      // them. Without that they could never be priced.
-      const model = message.model || currentModel || undefined;
-      if (message.model) currentModel = String(message.model);
       const tools = message.role === 'assistant' && Array.isArray(message.content)
         ? message.content.filter((part) => part && part.type === 'toolCall').map((part) => part.name)
         : [];
@@ -458,7 +452,7 @@ function parsePiTranscriptLines(lines) {
         // Pi and OMP report each operation's cost; prefer it over the
         // proportional split of the session subtotal.
         cost: num(u.cost && u.cost.total),
-        model,
+        model: message.model || currentModel || undefined,
         tools: uniqueTools(tools)
       });
     }

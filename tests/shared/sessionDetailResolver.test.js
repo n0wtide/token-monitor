@@ -525,6 +525,7 @@ test('a Pi detail read is never blocked on a catalog lookup', async () => {
   assert.ok(Date.now() - startedAt < 1000, 'the read does not wait for the catalog');
   assert.equal(first.exchanges[0].turns[0].costEstimate, 0);
   assert.equal(first.exchanges[0].turns[0].unpricedTokens, 150, 'an unknown rate is unpriced, never a share');
+  assert.equal(first.pricingPending, true, 'the page is told its prices are still being fetched');
   assert.equal(lookups, 1);
 
   finishLookup({ pricing: rates });
@@ -532,6 +533,7 @@ test('a Pi detail read is never blocked on a catalog lookup', async () => {
 
   const second = await readSessionDetailForPlatform(args, deps);
   assert.ok(Math.abs(second.exchanges[0].turns[0].costEstimate - 0.0002) < 1e-12);
+  assert.equal(second.pricingPending, undefined, 'a priced read is no longer pending');
   assert.equal(lookups, 1, 'a priced read reuses the cache instead of spawning again');
 
   const changed = await readSessionDetailForPlatform(args, { ...deps, getPricingRevision: () => 'pi-nonblocking-v2' });

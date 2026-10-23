@@ -443,6 +443,8 @@ function sessionDetailHarness(getSessionDetail) {
     visibleStatsSurface: () => 'main',
     isRendererWindowHidden: () => false,
     statsRenderScheduler: { request() {} },
+    setTimeout,
+    clearTimeout,
     sessionTooltipShouldHoldRender: () => false,
     renderSessionDetail: (args) => renders.push(args),
     window: { tokenMonitor: { getSessionDetail } }
@@ -690,6 +692,37 @@ for (const scenario of ['catch-up', 'hover', 'unchanged', 'hidden', 'closed', 'r
     }
   });
 }
+
+test('a detail still waiting on catalog prices re-reads itself until it is priced', async () => {
+  const replies = [
+    { found: true, pricingPending: true, marker: 1 },
+    { found: true, marker: 2 }
+  ];
+  const { openSessionDetail, renders, state } = sessionDetailHarness(() => Promise.resolve(replies.shift()));
+  // An idle session: no stats push ever changes its signature, so the pending
+  // flag is the only thing that can trigger the second read.
+  state.stats = { periods: { today: { sessions: {} } } };
+  await openSessionDetail({ client: 'pi', sessionId: 'pricing-pending', sessionCost: 0 });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(state.openSession.detail.marker, 2, 'the pending read is retried and painted');
+  assert.equal(renders.at(-1).detail.marker, 2);
+  assert.equal(state.openSession.pricingRetries, 0, 'a priced read resets the budget');
+});
+
+test('a detail the catalog cannot price retries a bounded number of times', async () => {
+  let reads = 0;
+  const { openSessionDetail, state } = sessionDetailHarness(() => {
+    reads += 1;
+    return Promise.resolve({ found: true, pricingPending: true, marker: reads });
+  });
+  state.stats = { periods: { today: { sessions: {} } } };
+  await openSessionDetail({ client: 'pi', sessionId: 'never-priced', sessionCost: 0 });
+  await new Promise((resolve) => setTimeout(resolve, 2600));
+  // First read, one immediate retry, then three scheduled ones.
+  assert.equal(reads, 4, 'an unpricable session stops retrying instead of spinning');
+  await new Promise((resolve) => setTimeout(resolve, 900));
+  assert.equal(reads, 4);
+});
 
 test('an open session detail re-reads only when its usage moved, and never mid-hover', async () => {
   const requests = [];

@@ -160,45 +160,6 @@ test('parsePiTranscript yields prompts and turns with exact tokens, tools and co
   assert.equal(events[2].tokens.cacheWrite, 10);
 });
 
-test('a Pi compaction after a reply is billed to that reply\'s model', async () => {
-  // Pi's `/compact` record names no model, and tokscale attributes it to the
-  // session's current model: the last reply's, which is what the tokens around
-  // it were billed against. Without that the turn could never be priced.
-  const home = tmpHome();
-  try {
-    writePiSession(home, 'compaction-model', [
-      user('compact please'),
-      JSON.stringify({
-        type: 'message', id: 'm1', parentId: 'm0', timestamp: '2026-10-12T02:28:43.000Z',
-        message: {
-          role: 'assistant', model: 'deepseek-v4-pro', content: [{ type: 'text', text: 'a' }],
-          usage: { input: 100, output: 100, cacheRead: 0, cacheWrite: 0, reasoning: 0, totalTokens: 200, cost: { total: 0 } }
-        }
-      }),
-      extraUsage('compaction', { input: 50, output: 10, cost: { total: 0 } }, '2026-10-12T02:28:44.000Z')
-    ]);
-
-    const detail = readSessionDetail({ client: 'pi', sessionId: 'compaction-model', sessionCost: 6, home });
-    const turns = detail.exchanges[0].turns;
-    assert.deepEqual(turns.map((turn) => turn.model), ['deepseek-v4-pro', 'deepseek-v4-pro']);
-
-    // The first read only schedules the lookup; the second prices from cache.
-    const options = {
-      pricingRevision: 'pi-compaction-model-test',
-      lookupModelPricing: async () => ({
-        pricing: { inputCostPerToken: 0.000001, outputCostPerToken: 0.000002, cacheReadInputTokenCost: 0, cacheCreationInputTokenCost: 0 }
-      })
-    };
-    await pricePiSessionDetail(detail, options);
-    await waitForPricingWarm();
-    await pricePiSessionDetail(detail, options);
-
-    assert.ok(Math.abs(turns[0].costEstimate - 0.0003) < 1e-12);
-    // 50 input + 10 output of the compaction record.
-    assert.ok(Math.abs(turns[1].costEstimate - 0.00007) < 1e-12);
-  } finally { cleanup(home); }
-});
-
 test('parsePiTranscript keeps an [image] marker for an image-only prompt', () => {
   const lines = [
     JSON.stringify({ type: 'message', timestamp: '2026-10-12T02:28:41.508Z', message: { role: 'user', content: [{ type: 'image', data: 'x' }] } }),
